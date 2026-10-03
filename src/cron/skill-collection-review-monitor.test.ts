@@ -55,6 +55,94 @@ describe("resolveSkillCollectionReviewMonitorSpecs", () => {
     );
   });
 
+  it("disables restricted research and discovery jobs without widening their policies", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        defaults: { model: "anthropic/claude-sonnet-4-6" },
+        entries: {
+          main: {},
+          research: { tools: { allow: ["research__*"], deny: ["group:fs", "group:runtime"] } },
+          discovery: { tools: { allow: ["discovery__*"], deny: ["group:fs", "group:runtime"] } },
+        },
+      },
+      tools: { allow: ["ls", "read", "write", "edit", "apply_patch", "exec", "process"] },
+      skills: { workshop: { autonomous: { mode: "auto" } } },
+    };
+    const before = structuredClone(cfg);
+    const byAgent = new Map(
+      Array.from(resolveSkillCollectionReviewMonitorSpecs(cfg, []), ({ agentId, input }) => [
+        agentId,
+        input,
+      ]),
+    );
+    expect(byAgent.get("main")?.enabled).toBe(true);
+    for (const agentId of ["research", "discovery"]) {
+      expect(byAgent.get(agentId)).toMatchObject({
+        enabled: false,
+        agentId,
+        displayName: expect.stringContaining("EFFECTIVE_TOOLSET_EMPTY"),
+      });
+      expect(byAgent.get(agentId)?.displayName).toContain(`agents.entries.${agentId}.tools`);
+      expect(byAgent.get(agentId)?.payload).toEqual(byAgent.get("main")?.payload);
+    }
+    expect(cfg).toEqual(before);
+  });
+
+  it.each([
+    {
+      name: "global allowlist",
+      tools: { allow: ["process"] },
+      agent: {},
+      reason: "MAINTENANCE_CAPABILITIES_MISSING: tools.allow",
+    },
+    {
+      name: "profile",
+      tools: { profile: "messaging" as const },
+      agent: {},
+      reason: "EFFECTIVE_TOOLSET_EMPTY: tools.profile",
+    },
+    {
+      name: "sandbox",
+      tools: { sandbox: { tools: { deny: ["group:fs", "group:runtime"] } } },
+      agent: { sandbox: { mode: "non-main" as const } },
+      reason: "EFFECTIVE_TOOLSET_EMPTY: tools.sandbox.tools",
+    },
+  ])("reports the $name layer independently of tool registration", ({ tools, agent, reason }) => {
+    const [spec] = resolveSkillCollectionReviewMonitorSpecs(
+      {
+        agents: { entries: { main: agent } },
+        skills: { workshop: { autonomous: { mode: "auto" } } },
+        tools,
+      },
+      [],
+    );
+    expect(spec?.input.enabled).toBe(false);
+    expect(spec?.input.displayName).toContain(reason);
+  });
+
+  it("keeps a compatible fallback and a shell-free file maintenance surface enabled", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        entries: {
+          fallback: {
+            model: { primary: "openai/gpt-5.2", fallbacks: ["anthropic/claude-sonnet-4-6"] },
+            tools: { byProvider: { openai: { allow: ["research__*"] } } },
+          },
+          fileOnly: { tools: { allow: ["ls", "read", "write"] } },
+        },
+      },
+      skills: { workshop: { autonomous: { mode: "auto" } } },
+    };
+    expect(
+      Array.from(resolveSkillCollectionReviewMonitorSpecs(cfg, []), ({ input }) => input.enabled),
+    ).toEqual([true, true]);
+    cfg.agents!.entries!.fallback!.model = "openai/gpt-5.2";
+    const [blocked] = resolveSkillCollectionReviewMonitorSpecs(cfg, []);
+    expect(blocked?.input.enabled).toBe(false);
+    expect(blocked?.input.displayName).toContain("EFFECTIVE_TOOLSET_EMPTY");
+    expect(blocked?.input.displayName).toContain("byProvider");
+  });
+
   it("creates jobs for every agent in an explicit fleet", () => {
     const explicitFleet = {
       agents: { ownership: "explicit", entries: { ops: {}, research: {} } },

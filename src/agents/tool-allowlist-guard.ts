@@ -44,6 +44,7 @@ export function buildEmptyExplicitToolAllowlistError(params: {
   disableTools?: boolean;
   toolsAllowExplicitlyEmpty?: boolean;
   skillWorkshop?: SkillWorkshopToolConstructionContext;
+  restrictionSource?: "before_prompt_build" | "tool-construction";
 }): Error | null {
   const toolsIntentionallyDisabled =
     params.disableTools === true || params.toolsAllowExplicitlyEmpty === true;
@@ -66,6 +67,15 @@ export function buildEmptyExplicitToolAllowlistError(params: {
   if (params.toolsEnabled && !toolsIntentionallyDisabled && workshopBlock) {
     return new Error(
       `No callable tools remain after resolving explicit tool allowlist (${requested}); ${workshopBlock.detail} ${workshopBlock.fix}`,
+    );
+  }
+  if (params.restrictionSource) {
+    const detail =
+      params.restrictionSource === "before_prompt_build"
+        ? "removed every callable tool"
+        : "produced no callable tools";
+    return new Error(
+      `EFFECTIVE_TOOLSET_EMPTY: ${params.restrictionSource} ${detail} requested by this run (${requested}). No provider prompt was submitted.`,
     );
   }
   const reason =

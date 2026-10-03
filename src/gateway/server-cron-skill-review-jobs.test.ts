@@ -292,6 +292,71 @@ describe("reconcileSkillCollectionReviewJobs", () => {
     }
   });
 
+  it("converges incompatible monitors to disabled and never recreates them enabled", async () => {
+    const testState = await createOpenClawTestState({ label: "skill-review-tool-policy" });
+    const cron = new CronService({
+      scheduler: createTestGatewayScheduler(),
+      storePath: testState.statePath("cron", "jobs.json"),
+      cronEnabled: false,
+      log: logger,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: vi.fn(),
+    });
+    const cfg: OpenClawConfig = {
+      agents: {
+        entries: {
+          main: {},
+          research: { tools: { allow: ["research__*"], deny: ["group:fs", "group:runtime"] } },
+          discovery: { tools: { allow: ["discovery__*"], deny: ["group:fs", "group:runtime"] } },
+        },
+      },
+      skills: { workshop: { autonomous: { mode: "auto" } } },
+    };
+    try {
+      await saveCronJobsStore(testState.statePath("cron", "jobs.json"), {
+        version: 1,
+        jobs: [monitorJob("main"), monitorJob("research"), monitorJob("discovery")],
+      });
+      // Stored runtime preferences do not override agent isolation.
+      await upsertSessionEntryCore(
+        { agentId: "research", sessionKey: "agent:research:cron:job-research" },
+        {
+          sessionId: "review-preference",
+          updatedAt: Date.now(),
+          modelOverride: "claude-sonnet-4-6",
+          providerOverride: "anthropic",
+        },
+      );
+      await reconcileSkillCollectionReviewJobs({ cron, cfg, logger });
+      const first = await cron.list({ includeDisabled: true });
+      expect(first.filter((job) => job.enabled).map((job) => job.agentId)).toEqual(["main"]);
+      expect(first.filter((job) => !job.enabled)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "job-research",
+            displayName: expect.stringContaining("EFFECTIVE_TOOLSET_EMPTY"),
+          }),
+          expect.objectContaining({
+            id: "job-discovery",
+            displayName: expect.stringContaining("EFFECTIVE_TOOLSET_EMPTY"),
+          }),
+        ]),
+      );
+      await reconcileSkillCollectionReviewJobs({ cron, cfg, logger });
+      expect(await cron.list({ includeDisabled: true })).toEqual(first);
+      await cron.remove("job-research", { systemOwned: true });
+      await reconcileSkillCollectionReviewJobs({ cron, cfg, logger });
+      expect(
+        (await cron.list({ includeDisabled: true })).find((job) => job.agentId === "research")
+          ?.enabled,
+      ).toBe(false);
+    } finally {
+      cron.stop();
+      await testState.cleanup();
+    }
+  });
+
   it("replaces retired jobs on the current database and converges once per agent after restart", async () => {
     const testState = await createOpenClawTestState({ label: "skill-review-convergence" });
     const storePath = testState.statePath("cron", "jobs.json");

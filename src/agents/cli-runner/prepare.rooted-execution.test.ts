@@ -23,6 +23,9 @@ import {
 } from "./prepare.test-support.js";
 import type { PreparedCliRunContext, RunCliAgentParams } from "./types.js";
 
+const getGlobalHookRunner = vi.hoisted(() => vi.fn());
+vi.mock("../../plugins/hook-runner-global.js", () => ({ getGlobalHookRunner }));
+
 const resolveSandboxContext = vi.hoisted(() => vi.fn<typeof ResolveSandboxContext>());
 vi.mock("../sandbox.js", () => ({
   resolveSandboxContext,
@@ -40,6 +43,7 @@ describe("rooted CLI preparation", () => {
   const prepareSkillsPlugin = vi.fn(async () => ({ args: [], cleanup: async () => {} }));
 
   beforeEach(() => {
+    getGlobalHookRunner.mockReset().mockReturnValue(undefined);
     resolveSandboxContext.mockReset().mockResolvedValue(null);
     prepareExecution.mockReset().mockResolvedValue({ toolAvailabilityEnforced: true });
     mintGrant.mockReset().mockImplementation(createTestMcpLoopbackClientGrant);
@@ -159,6 +163,50 @@ describe("rooted CLI preparation", () => {
       }),
     );
     expect(prepareExecution.mock.calls[0]?.[0]).not.toHaveProperty("rootedExecution");
+  });
+
+  it.each([{ toolsAllow: [] }, { toolsAllow: ["research__*"] }])(
+    "rejects an empty effective hook projection before granting tools or preparing the CLI: %j",
+    async ({ toolsAllow }) => {
+      getGlobalHookRunner.mockReturnValue({
+        hasHooks: (name: string) => name === "before_prompt_build",
+        runBeforePromptBuild: async () => ({ toolsAllow }),
+      });
+      await expect(prepare({ toolsAllow: ["read", "write", "exec"] })).rejects.toThrow(
+        "EFFECTIVE_TOOLSET_EMPTY: before_prompt_build",
+      );
+      expect(mintGrant).not.toHaveBeenCalled();
+      expect(prepareExecution).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ toolsAllow: undefined }, { toolsAllow: ["*"] }])(
+    "does not blame a permissive hook for an already empty construction surface: %j",
+    async ({ toolsAllow }) => {
+      projectTools.mockResolvedValue({ agentId: "main", tools: [] });
+      getGlobalHookRunner.mockReturnValue({
+        hasHooks: (name: string) => name === "before_prompt_build",
+        runBeforePromptBuild: async () => ({ toolsAllow }),
+      });
+      await expect(prepare({ toolsAllow: ["read", "write"] })).rejects.toThrow(
+        "EFFECTIVE_TOOLSET_EMPTY: tool-construction",
+      );
+      expect(mintGrant).not.toHaveBeenCalled();
+      expect(prepareExecution).not.toHaveBeenCalled();
+    },
+  );
+
+  it("retains compatible maintenance tools after a hook cap", async () => {
+    getGlobalHookRunner.mockReturnValue({
+      hasHooks: (name: string) => name === "before_prompt_build",
+      runBeforePromptBuild: async () => ({ toolsAllow: ["read", "write"] }),
+    });
+    await prepare({ toolsAllow: ["read", "write", "exec"] });
+    expect(prepareExecution).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toolAvailability: { native: [], openClaw: ["read", "write", "apply_patch"] },
+      }),
+    );
   });
 
   it.each([

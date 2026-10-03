@@ -1,3 +1,9 @@
+import type { CliBackendPlugin } from "../../plugins/cli-backend.types.js";
+import { applyEmbeddedAttemptToolsAllow } from "../embedded-agent-runner/run/attempt-tool-construction-plan.js";
+import {
+  buildEmptyExplicitToolAllowlistError,
+  collectExplicitToolAllowlistSources,
+} from "../tool-allowlist-guard.js";
 import { normalizeToolPolicyName } from "../tool-policy.js";
 
 /** Transport prefix CLI harnesses use for loopback OpenClaw MCP tool names. */
@@ -31,4 +37,44 @@ export function resolveCliRuntimeToolsAllow(
   return toolsAllow.some((toolName) => normalizeToolPolicyName(toolName) === "*")
     ? undefined
     : toolsAllow;
+}
+
+/** Apply the hook cap to the materialized CLI surface before grants or backend preparation. */
+export function projectCliPromptTools<T extends { name: string }>(params: {
+  tools: T[];
+  toolsAllow?: string[];
+  rooted: boolean;
+  requestedTools?: string[];
+  restrictsTools: boolean;
+  backend: Pick<CliBackendPlugin, "id" | "nativeToolMode">;
+  canEnforceExactToolAvailability: boolean;
+}): T[] {
+  const tools = applyEmbeddedAttemptToolsAllow(params.tools, params.toolsAllow);
+  if (params.rooted) {
+    const error = buildEmptyExplicitToolAllowlistError({
+      sources: collectExplicitToolAllowlistSources([
+        {
+          label: "runtime toolsAllow",
+          allow: params.requestedTools ?? params.tools.map((tool) => tool.name),
+          enforceWhenToolsDisabled: true,
+        },
+      ]),
+      hasCallableTools: tools.length > 0,
+      toolsEnabled: true,
+      restrictionSource: params.tools.length === 0 ? "tool-construction" : "before_prompt_build",
+    });
+    if (error) {
+      throw error;
+    }
+  }
+  if (
+    params.restrictsTools &&
+    (params.backend.nativeToolMode === "always-on" ||
+      (params.backend.nativeToolMode === "selectable" && !params.canEnforceExactToolAvailability))
+  ) {
+    throw new Error(
+      `CLI backend "${params.backend.id}" cannot enforce before_prompt_build tool restrictions. Use a backend with exact tool availability or remove the hook restriction. OpenClaw did not start the run.`,
+    );
+  }
+  return tools;
 }

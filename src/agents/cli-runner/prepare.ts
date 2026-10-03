@@ -172,6 +172,7 @@ import {
 } from "./session-history.js";
 import { resolveCliSkillsPrompt } from "./skills-prompt.js";
 import { prepareCliReplyToolAuthority } from "./tool-authority.js";
+import { projectCliPromptTools } from "./tool-policy.js";
 import {
   captureCliRunStartTime,
   type CliReusableSession,
@@ -1103,19 +1104,15 @@ async function prepareCliRunContextWithinReadFence(
         ).tools
       : [];
   params.assertCurrent?.();
-  const hookFilteredProjectedTools = applyEmbeddedAttemptToolsAllow(
-    projectedToolsBeforePromptBuild,
-    promptBuildToolsAllow,
-  );
-  if (
-    promptBuildRestrictsTools &&
-    (backendResolved.nativeToolMode === "always-on" ||
-      (backendResolved.nativeToolMode === "selectable" && !canEnforceExactToolAvailability))
-  ) {
-    throw new Error(
-      `CLI backend "${backendResolved.id}" cannot enforce before_prompt_build tool restrictions. Use a backend with exact tool availability or remove the hook restriction. OpenClaw did not start the run.`,
-    );
-  }
+  const hookFilteredProjectedTools = projectCliPromptTools({
+    tools: projectedToolsBeforePromptBuild,
+    toolsAllow: promptBuildToolsAllow,
+    rooted: Boolean(rootedExecution),
+    requestedTools: runtimeToolsAllowPolicy ?? rootedToolsAllow,
+    restrictsTools: promptBuildRestrictsTools,
+    backend: backendResolved,
+    canEnforceExactToolAvailability,
+  });
   if (
     (promptBuildRestrictsTools &&
       params.cliToolAvailability === undefined &&

@@ -52,6 +52,25 @@ a disposable copy. A writable sandbox uses the agent's Workshop directory.
 Sandbox backends must support directory reads to provide shell-free discovery.
 Bundled backends use their existing filesystem permissions for these reads.
 
+Projection also intersects the maintenance tools with the global, agent, profile,
+provider, and applicable sandbox policies. A job with no effective tools remains
+disabled with `EFFECTIVE_TOOLSET_EMPTY`; one lacking listing, reading, or editing
+capabilities reports `MAINTENANCE_CAPABILITIES_MISSING`. The reason identifies the
+policy source. Startup and reload preserve this disabled projection, including
+when an incompatible monitor is recreated. Stored model preferences cannot bypass
+agent restrictions. Research-only agents keep their isolation; review does not
+borrow another agent's privileges.
+
+An enabled projection only means that static configuration has not proven the
+job incompatible. It is not proof that tools were registered or that runtime
+hooks permit them. Tool construction, model support, prompt-hook restrictions,
+and argument-dependent tool hooks remain runtime checks. A missing registration,
+a policy exclusion, and a hook refusal are distinct evidence; do not infer hook
+compatibility from a nonempty configured allowlist. If a prompt hook removes all
+requested tools, embedded and rooted CLI reviews refuse before provider submission
+with `EFFECTIVE_TOOLSET_EMPTY: before_prompt_build`. Argument-dependent tool hooks
+still decide at the call boundary; projection does not invoke them as probes.
+
 ### Changes and recovery
 
 Collection review follows normal agent file-edit semantics. Completed edits

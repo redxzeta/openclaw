@@ -577,6 +577,51 @@ describe("runEmbeddedAttemptPromptPhase", () => {
     ]);
   });
 
+  it("refuses a scheduled requested tool set emptied by prompt-hook enforcement", async () => {
+    const fixture = createFixture();
+    fixture.input.attempt.toolsAllow = ["ls", "read", "write"];
+    const assemble = mocks.preparePromptAssembly.getMockImplementation()!;
+    mocks.preparePromptAssembly.mockImplementationOnce((input) =>
+      assemble({
+        ...input,
+        applyPromptBuildToolsAllow: () => input.applyPromptBuildToolsAllow([]),
+      }),
+    );
+    mocks.applyPromptToolsAllow.mockImplementationOnce(() => ({
+      ...fixture.input.prepared.promptToolPolicy.current,
+      callableToolNames: [],
+    }));
+    mocks.observePrompt.mockImplementationOnce((input: { skipPromptSubmission: boolean }) => ({
+      skipPromptSubmission: input.skipPromptSubmission,
+    }));
+
+    await runEmbeddedAttemptPromptPhase(fixture.input, fixture.promptState);
+
+    expect(fixture.readState().promptError).toMatchObject({
+      message: expect.stringContaining("EFFECTIVE_TOOLSET_EMPTY: before_prompt_build"),
+    });
+    expect(fixture.readState().promptErrorSource).toBe("precheck");
+    expect(mocks.submitPrompt).not.toHaveBeenCalled();
+  });
+
+  it("allows a hook to choose a tool-free turn when no tools were requested", async () => {
+    const fixture = createFixture();
+    const assemble = mocks.preparePromptAssembly.getMockImplementation()!;
+    mocks.preparePromptAssembly.mockImplementationOnce((input) =>
+      assemble({
+        ...input,
+        applyPromptBuildToolsAllow: () => input.applyPromptBuildToolsAllow([]),
+      }),
+    );
+    mocks.applyPromptToolsAllow.mockImplementationOnce(() => ({
+      ...fixture.input.prepared.promptToolPolicy.current,
+      callableToolNames: [],
+    }));
+    await runEmbeddedAttemptPromptPhase(fixture.input, fixture.promptState);
+    expect(fixture.readState().promptError).toBeNull();
+    expect(mocks.submitPrompt).toHaveBeenCalledOnce();
+  });
+
   it("honors a tool-policy failure published during prompt assembly", async () => {
     const fixture = createFixture();
     const failure = new Error("explicit tool allowlist is empty");

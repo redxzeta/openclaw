@@ -43,6 +43,9 @@ describe("embedded Tool Search prompt parity", () => {
     "submits only the current $mode catalog after hook allowlist $toolsAllow",
     async ({ mode, toolsAllow }) => {
       const fixture = createFixture({ pendingImageCount: 0 });
+      if (toolsAllow?.length) {
+        fixture.input.attempt.toolsAllow = ["fixture_allowed", "fixture_denied"];
+      }
       const config = {
         agents: { defaults: { experimental: { localModelLean: false } } },
         tools: { codeMode: false, toolSearch: { enabled: true, mode } },

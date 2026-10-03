@@ -13,6 +13,10 @@ import {
 } from "../../sessions/compaction/request-budget.js";
 import { withSessionManagerWrite } from "../../sessions/session-manager-write-admission.js";
 import { releasePendingAgentSteeringItems } from "../../subagents/registry/subagent-registry.js";
+import {
+  buildEmptyExplicitToolAllowlistError,
+  collectExplicitToolAllowlistSources,
+} from "../../tool-allowlist-guard.js";
 import { prepareGooglePromptCacheStreamFn } from "../google-prompt-cache.js";
 import { log } from "../logger.js";
 import { persistToolResultProjections } from "../session-prompt-state.js";
@@ -149,6 +153,7 @@ export async function runEmbeddedAttemptPromptPhase(
   const promptStartedAt = Date.now();
 
   let transcriptLeafId: string | null = null;
+  let promptHookToolError: Error | null = null;
   try {
     const promptAssembly = await prepareEmbeddedAttemptPromptAssembly({
       attempt,
@@ -165,7 +170,23 @@ export async function runEmbeddedAttemptPromptPhase(
       setActiveSessionSystemPrompt,
       applyPromptBuildToolsAllow: (toolsAllow) => {
         // Hook authority follows reachable capabilities, not just provider-visible controls.
-        return promptToolPolicy.apply(toolsAllow).callableToolNames;
+        const names = promptToolPolicy.apply(toolsAllow).callableToolNames;
+        promptHookToolError =
+          toolsAllow !== undefined
+            ? buildEmptyExplicitToolAllowlistError({
+                sources: collectExplicitToolAllowlistSources([
+                  {
+                    label: "runtime toolsAllow",
+                    allow: attempt.toolsAllow,
+                    enforceWhenToolsDisabled: true,
+                  },
+                ]),
+                hasCallableTools: names.length > 0,
+                toolsEnabled: true,
+                restrictionSource: "before_prompt_build",
+              })
+            : null;
+        return names;
       },
       prepareSystemPrompt: async (currentSystemPrompt) => {
         const refresh = await prepared.systemPrompt.prepareToolPrompt?.(
@@ -178,10 +199,12 @@ export async function runEmbeddedAttemptPromptPhase(
       },
     });
     systemPromptText = sessionRuntimeState.systemPromptText;
-    if (prepared.toolCatalog.emptyExplicitToolAllowlistError) {
-      setFailure(prepared.toolCatalog.emptyExplicitToolAllowlistError, "precheck");
+    const toolPolicyError =
+      prepared.toolCatalog.emptyExplicitToolAllowlistError ?? promptHookToolError;
+    if (toolPolicyError) {
+      setFailure(toolPolicyError, "precheck");
       skipPromptSubmission = true;
-      log.warn(`[tools] ${prepared.toolCatalog.emptyExplicitToolAllowlistError.message}`);
+      log.warn(`[tools] ${toolPolicyError.message}`);
     }
     const { hookCtx, promptBuildPrependContext, promptBuildAppendContext } = promptAssembly;
     transcriptLeafId = promptAssembly.transcriptLeafId;

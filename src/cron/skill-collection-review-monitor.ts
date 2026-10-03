@@ -6,6 +6,7 @@ import {
   resolveSubagentModelConfigSelectionResult,
   resolveSubagentModelFallbacksOverride,
 } from "../agents/agent-scope.js";
+import { resolveEffectiveToolPolicy } from "../agents/agent-tools.policy.js";
 import { resolveAvailableAgentHarnessPolicy } from "../agents/harness/availability.js";
 import { resolveModelCandidateChain } from "../agents/model-fallback-candidates.js";
 import { resolveCliRuntimeExecutionProvider } from "../agents/model-runtime-aliases.js";
@@ -17,6 +18,13 @@ import {
   normalizeModelSelection,
   resolveModelRefFromString,
 } from "../agents/model-selection-shared.js";
+import { resolveSandboxToolPolicyForAgent } from "../agents/sandbox/tool-policy.js";
+import { createToolAccessDiagnostics } from "../agents/tool-access-diagnostics.js";
+import {
+  applyToolPolicyPipeline,
+  buildDefaultToolPolicyPipelineSteps,
+} from "../agents/tool-policy-pipeline.js";
+import { mergeAlsoAllowPolicy, resolveToolProfilePolicy } from "../agents/tool-policy.js";
 import {
   resolveAgentModelFallbackValues,
   resolveAgentModelPrimaryValue,
@@ -43,12 +51,92 @@ import type { CronJob, CronJobCreate } from "./types.js";
 const SKILL_COLLECTION_REVIEW_EVERY_MS = 7 * 24 * 60 * 60_000;
 const SKILL_COLLECTION_REVIEW_NO_ROOTED_RUNTIME_REASON = "no-rooted-runtime";
 
+type ReviewEligibility = { eligible: true | undefined } | { eligible: false; reason: string };
+
+function combineReviewEligibility(outcomes: ReviewEligibility[]): ReviewEligibility {
+  return (
+    outcomes.find((outcome) => outcome.eligible === true) ??
+    outcomes.find((outcome) => outcome.eligible === undefined) ??
+    outcomes[0] ?? { eligible: undefined }
+  );
+}
+
+/** Projection can prove policy exclusion, never tool construction or a future hook result. */
+function resolveMaintenanceToolPolicyBlock(
+  cfg: OpenClawConfig,
+  agentId: string,
+  model?: { provider: string; model: string },
+): string | undefined {
+  const policy = resolveEffectiveToolPolicy({
+    config: cfg,
+    agentId,
+    modelProvider: model?.provider,
+    modelId: model?.model,
+  });
+  const diagnostics = createToolAccessDiagnostics({
+    profiles: policy.profiles,
+    toolNames: SKILL_WORKSHOP_MAINTENANCE_TOOLS,
+  });
+  const agentConfig = resolveAgentConfig(cfg, agentId);
+  // Review sessions are isolated, so both all and non-main enable sandbox policy.
+  const sandboxMode = agentConfig?.sandbox?.mode ?? cfg.agents?.defaults?.sandbox?.mode;
+  const tools = applyToolPolicyPipeline({
+    tools: SKILL_WORKSHOP_MAINTENANCE_TOOLS.map((name) => ({ name })),
+    toolMeta: () => undefined,
+    warn: () => undefined,
+    steps: [
+      ...buildDefaultToolPolicyPipelineSteps({
+        ...policy,
+        profilePolicy: mergeAlsoAllowPolicy(
+          resolveToolProfilePolicy(policy.profile),
+          policy.profileAlsoAllow,
+        ),
+        providerProfilePolicy: mergeAlsoAllowPolicy(
+          resolveToolProfilePolicy(policy.providerProfile),
+          policy.providerProfileAlsoAllow,
+        ),
+      }),
+      ...(sandboxMode && sandboxMode !== "off"
+        ? [
+            {
+              policy: resolveSandboxToolPolicyForAgent(cfg, agentId),
+              label: "sandbox tools",
+              source: { kind: "runtime" as const, path: "tools.sandbox.tools" },
+            },
+          ]
+        : []),
+    ],
+    onFilter: diagnostics.onFilter,
+  });
+  const names = new Set<string>(tools.map((tool) => tool.name));
+  // Listing, reading, and editing are required; shell and patch tools are alternatives.
+  const missing = [
+    ["ls", "exec"],
+    ["read", "exec"],
+    ["write", "edit", "apply_patch", "exec"],
+  ].find((alternatives) => !alternatives.some((name) => names.has(name)));
+  if (!missing) {
+    return undefined;
+  }
+  const reason =
+    tools.length === 0 ? "EFFECTIVE_TOOLSET_EMPTY" : "MAINTENANCE_CAPABILITIES_MISSING";
+  const sources = [
+    ...new Set(
+      diagnostics
+        .finish()
+        .tools.filter((tool) => missing.includes(tool.id))
+        .flatMap((tool) => tool.reasons.map((entry) => entry.source ?? entry.label)),
+    ),
+  ];
+  return `${reason}: ${sources.join(", ")}`;
+}
+
 /** Returns undefined when static config cannot prove the full runtime chain. */
-function hasEligibleSkillCollectionReviewRuntime(
+function resolveSkillCollectionReviewEligibility(
   cfg: OpenClawConfig,
   agentId: string,
   manifestPlugins: ManifestModelIdNormalizationSource,
-): boolean | undefined {
+): ReviewEligibility {
   const normalization = { manifestPlugins, allowPluginNormalization: false } as const;
   const agentConfig = resolveAgentConfig(cfg, agentId);
   const { cfgWithAgentDefaults } = resolveCronAgentConfigFromSnapshot({
@@ -90,7 +178,7 @@ function hasEligibleSkillCollectionReviewRuntime(
       })?.ref
     : defaultRef;
   if (!selected) {
-    return undefined;
+    return { eligible: undefined };
   }
 
   const agentModel = agentConfig?.model;
@@ -115,39 +203,39 @@ function hasEligibleSkillCollectionReviewRuntime(
     { selected, fallbacksOverride },
     { selected: defaultRef, fallbacksOverride: defaultFallbacks },
   ];
-  const eligibility = new Set(
-    chains.map((chain) => {
-      // A plugin-owned or otherwise unresolved ref may become runnable after runtime preparation.
-      // Keep the job enabled unless every configured candidate can be classified now.
-      if (
-        chain.fallbacksOverride.some(
-          (raw) =>
-            !resolveModelRefFromString({
-              cfg: cfgWithAgentDefaults,
-              agentId,
-              aliasIndex,
-              ...normalization,
-              raw,
-              defaultProvider: chain.selected.provider,
-            }),
-        )
-      ) {
-        return undefined;
-      }
+  const eligibility = chains.map((chain): ReviewEligibility => {
+    // A plugin-owned or otherwise unresolved ref may become runnable after runtime preparation.
+    // Keep the job enabled unless every configured candidate can be classified now.
+    if (
+      chain.fallbacksOverride.some(
+        (raw) =>
+          !resolveModelRefFromString({
+            cfg: cfgWithAgentDefaults,
+            agentId,
+            aliasIndex,
+            ...normalization,
+            raw,
+            defaultProvider: chain.selected.provider,
+          }),
+      )
+    ) {
+      return { eligible: undefined };
+    }
 
-      const candidates = resolveModelCandidateChain({
-        cfg: cfgWithAgentDefaults,
-        ...normalization,
-        agentId,
-        provider: chain.selected.provider,
-        model: chain.selected.model,
-        requestedRouteResolution: "resolved",
-        fallbacksOverride: chain.fallbacksOverride,
-      });
-      if (candidates.length === 0) {
-        return undefined;
-      }
-      return candidates.some((candidate) => {
+    const candidates = resolveModelCandidateChain({
+      cfg: cfgWithAgentDefaults,
+      ...normalization,
+      agentId,
+      provider: chain.selected.provider,
+      model: chain.selected.model,
+      requestedRouteResolution: "resolved",
+      fallbacksOverride: chain.fallbacksOverride,
+    });
+    if (candidates.length === 0) {
+      return { eligible: undefined };
+    }
+    return combineReviewEligibility(
+      candidates.map((candidate): ReviewEligibility => {
         const policy = resolveAvailableAgentHarnessPolicy({
           mode: "projection",
           config: cfgWithAgentDefaults,
@@ -164,18 +252,26 @@ function hasEligibleSkillCollectionReviewRuntime(
           }) ?? candidate.provider;
         // Implicit/auto runtime selection can still fall back to embedded
         // execution after harness preparation; it cannot prove rejection here.
-        return (
+        const rooted =
           policy.runtimeSource === "implicit" ||
           policy.runtime === "auto" ||
           supportsCronExecutionRoot(
             policy.runtime,
             isCliProvider(executionProvider, cfgWithAgentDefaults),
-          )
+          );
+        if (!rooted) {
+          return { eligible: false, reason: SKILL_COLLECTION_REVIEW_NO_ROOTED_RUNTIME_REASON };
+        }
+        const toolBlock = resolveMaintenanceToolPolicyBlock(
+          cfgWithAgentDefaults,
+          agentId,
+          candidate,
         );
-      });
-    }),
-  );
-  return eligibility.has(true) ? true : eligibility.has(undefined) ? undefined : false;
+        return toolBlock ? { eligible: false, reason: toolBlock } : { eligible: true };
+      }),
+    );
+  });
+  return combineReviewEligibility(eligibility);
 }
 
 export function skillCollectionReviewMonitorAgentId(job: CronJob): string | undefined {
@@ -222,7 +318,7 @@ export function* resolveSkillCollectionReviewMonitorSpecs(
   const manifestPlugins =
     getCurrentPluginMetadataSnapshot({ config: cfg, allowWorkspaceScopedSnapshot: true }) ?? [];
   for (const agentId of listAgentIds(cfg)) {
-    const configuredEligibility = hasEligibleSkillCollectionReviewRuntime(
+    const configuredEligibility = resolveSkillCollectionReviewEligibility(
       cfg,
       agentId,
       manifestPlugins,
@@ -230,21 +326,25 @@ export function* resolveSkillCollectionReviewMonitorSpecs(
     const existing = retained.get(agentId);
     // Config cannot prove the execution chain while a stored session can select
     // a different model or runtime. Leave preference validation to the runner.
-    const hasEligibleRuntime =
-      configuredEligibility === false &&
+    const eligibility: ReviewEligibility =
+      configuredEligibility.eligible === false &&
       existing &&
       hasStoredExecutionPreference(cfg, agentId, existing.id)
-        ? undefined
+        ? { eligible: undefined }
         : configuredEligibility;
-    const enabled = workshopEnabled && hasEligibleRuntime !== false;
+    // A stored runtime preference cannot override global/agent/sandbox restrictions.
+    const toolBlock = resolveMaintenanceToolPolicyBlock(cfg, agentId);
+    const blockedReason =
+      toolBlock ?? (eligibility.eligible === false ? eligibility.reason : undefined);
+    const enabled = workshopEnabled && !blockedReason;
     yield {
       agentId,
       input: {
         declarationKey: `${SKILL_COLLECTION_REVIEW_DECLARATION_PREFIX}${agentId}`,
         name: `skill-collection-review-${agentId}`,
         displayName:
-          workshopEnabled && hasEligibleRuntime === false
-            ? `[${SKILL_COLLECTION_REVIEW_NO_ROOTED_RUNTIME_REASON}] Skill collection review (${agentId})`
+          workshopEnabled && blockedReason
+            ? `[${blockedReason}] Skill collection review (${agentId})`
             : `Skill collection review (${agentId})`,
         agentId,
         enabled,
